@@ -1,7 +1,7 @@
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QSpinBox, QSlider, QFileDialog, QGroupBox,
-    QProgressBar, QApplication,
+    QProgressBar, QApplication, QCheckBox,
 )
 from qtpy.QtCore import Qt
 import numpy as np
@@ -20,6 +20,13 @@ class ShiftWidget(QWidget):
 
         self._updating_ui = False  # guard against feedback loops
         self._dims_connected = False
+
+        # Range-apply anchor state
+        self._anchor_t = None
+        self._anchor_dx = None
+        self._anchor_dy = None
+        self._anchor_plane = None
+
         self._build_ui()
 
     def _build_ui(self):
@@ -107,6 +114,34 @@ class ShiftWidget(QWidget):
         actions_layout.addWidget(self.btn_reset)
 
         layout.addWidget(actions_group)
+
+        # --- Range apply ---
+        range_group = QGroupBox("Range Apply")
+        range_layout = QVBoxLayout(range_group)
+
+        self.chk_all_planes = QCheckBox("All planes")
+        range_layout.addWidget(self.chk_all_planes)
+
+        self.btn_anchor = QPushButton("Anchor shift here")
+        self.btn_anchor.clicked.connect(self._on_anchor)
+        range_layout.addWidget(self.btn_anchor)
+
+        self.range_status = QLabel("")
+        range_layout.addWidget(self.range_status)
+
+        range_btn_row = QHBoxLayout()
+        self.btn_range_cancel = QPushButton("Cancel")
+        self.btn_range_cancel.setEnabled(False)
+        self.btn_range_cancel.clicked.connect(self._on_range_cancel)
+        range_btn_row.addWidget(self.btn_range_cancel)
+
+        self.btn_range_apply = QPushButton("Apply range")
+        self.btn_range_apply.setEnabled(False)
+        self.btn_range_apply.clicked.connect(self._on_range_apply)
+        range_btn_row.addWidget(self.btn_range_apply)
+        range_layout.addLayout(range_btn_row)
+
+        layout.addWidget(range_group)
 
         # --- Save ---
         save_group = QGroupBox("Save")
@@ -261,6 +296,66 @@ class ShiftWidget(QWidget):
         self._display_mask()
         self.status_label.setText("All shifts reset to (0, 0)")
 
+    def _on_anchor(self):
+        """Record the current timepoint, plane, and shift as anchor."""
+        if self.shift_model is None:
+            return
+        self._anchor_t = self._current_time()
+        self._anchor_plane = self._current_plane()
+        self._anchor_dx = self.dx_slider.value()
+        self._anchor_dy = self.dy_slider.value()
+
+        self.btn_anchor.setEnabled(False)
+        self.btn_range_apply.setEnabled(True)
+        self.btn_range_cancel.setEnabled(True)
+        self.range_status.setText(
+            f"Anchored at t={self._anchor_t}, plane {self._anchor_plane}, "
+            f"shift ({self._anchor_dx}, {self._anchor_dy}).\n"
+            f"Scroll to target and click Apply."
+        )
+
+    def _on_range_apply(self):
+        """Apply the anchored shift to the range anchor_t..current_t."""
+        if self.shift_model is None or self._anchor_t is None:
+            return
+        t_now = self._current_time()
+        t_start = min(self._anchor_t, t_now)
+        t_end = max(self._anchor_t, t_now)
+        dx, dy = self._anchor_dx, self._anchor_dy
+
+        if self.chk_all_planes.isChecked():
+            for p in range(self.shift_model.n_planes):
+                self.shift_model.set_shift_range(t_start, t_end, p, dx, dy)
+            plane_msg = "all planes"
+        else:
+            self.shift_model.set_shift_range(
+                t_start, t_end, self._anchor_plane, dx, dy
+            )
+            plane_msg = f"plane {self._anchor_plane}"
+
+        self.status_label.setText(
+            f"Applied shift ({dx}, {dy}) to t={t_start}..{t_end} for {plane_msg}"
+        )
+        self._clear_anchor()
+        self._display_mask()
+        self._update_shift_spinboxes()
+
+    def _on_range_cancel(self):
+        """Cancel the anchored range apply."""
+        self._clear_anchor()
+        self.status_label.setText("Range apply cancelled")
+
+    def _clear_anchor(self):
+        """Reset anchor state and UI back to idle."""
+        self._anchor_t = None
+        self._anchor_dx = None
+        self._anchor_dy = None
+        self._anchor_plane = None
+        self.btn_anchor.setEnabled(True)
+        self.btn_range_apply.setEnabled(False)
+        self.btn_range_cancel.setEnabled(False)
+        self.range_status.setText("")
+
     def _display_current(self, auto_contrast=False):
         """Load and display the current timepoint's image and shifted mask."""
         stack_name = self.combo_stack.currentText()
@@ -274,11 +369,30 @@ class ShiftWidget(QWidget):
         self._update_shift_spinboxes()
 
     def _display_mask(self):
-        """Apply shifts and display the mask for the current timepoint."""
+        """Apply shifts and display the mask for the current timepoint.
+
+        While an anchor is active, previews the anchored shift on the
+        relevant plane(s) so the user can see where the mask will land.
+        """
         if self.shift_model is None:
             return
         t = self._current_time()
         shifted = self.shift_model.apply_shifts_for_timepoint(t)
+
+        # Preview anchored shift while in range-apply mode
+        if self._anchor_t is not None:
+            dx, dy = self._anchor_dx, self._anchor_dy
+            if self.chk_all_planes.isChecked():
+                for p in range(self.shift_model.n_planes):
+                    shifted[p] = self.shift_model._shift_plane(
+                        self.shift_model.base_mask[p], dx, dy
+                    )
+            else:
+                p = self._anchor_plane
+                shifted[p] = self.shift_model._shift_plane(
+                    self.shift_model.base_mask[p], dx, dy
+                )
+
         self.viewer_manager.show_labels(shifted, name="mask")
 
     def _update_shift_spinboxes(self):

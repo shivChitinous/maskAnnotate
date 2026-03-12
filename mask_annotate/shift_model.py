@@ -40,6 +40,10 @@ class ShiftModel:
         """Copy a shift to all planes for a given timepoint."""
         self.shifts[t, :] = [dx, dy]
 
+    def set_shift_range(self, t_start, t_end, plane, dx, dy):
+        """Apply (dx, dy) to timepoints t_start..t_end (inclusive) for one plane."""
+        self.shifts[t_start:t_end + 1, plane] = [dx, dy]
+
     def reset_all(self):
         """Zero out all shifts."""
         self.shifts[:] = 0

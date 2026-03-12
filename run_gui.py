@@ -39,41 +39,75 @@ def main():
     viewer.window._qt_window.tabifyDockWidget(dock_cleanup, dock_shift)
     dock_load.raise_()  # Show the Load tab first
 
-    # Wire tab switches — sync data when leaving a stage, activate when entering.
-    # Deferred with QTimer so the QTabBar is fully constructed first.
-    prev_tab = [0]  # mutable so the closure can update it
+    # --- Tab-switch wiring ---
+    # Two independent mechanisms ensure tab changes are detected reliably:
+    #   1. QDockWidget.visibilityChanged  (fires for tabified docks per Qt docs)
+    #   2. QTabBar.currentChanged         (fallback, with retry until found)
+    # Both funnel into _do_transition(), which guards against double-firing.
 
-    def _on_tab_changed(index, tab_bar):
-        prev = prev_tab[0]
-        if prev == index:
+    _current_tab = [0]          # 0=Load, 1=Cleanup, 2=Shift
+    _ready = [False]            # gate: ignore signals during initial window setup
+
+    def _do_transition(new_idx):
+        """Sync data when leaving a stage, activate when entering."""
+        if not _ready[0] or new_idx == _current_tab[0]:
             return
-
-        prev_text = tab_bar.tabText(prev)
-        new_text = tab_bar.tabText(index)
+        prev = _current_tab[0]
 
         # Sync when leaving a stage
-        if "Load" in prev_text:
+        if prev == 0:
             load_w.apply_roi_filter()
-        elif "Cleanup" in prev_text:
+        elif prev == 1:
             cleanup_w._sync_labels_to_data()
 
         # Activate when entering a stage
-        if "Cleanup" in new_text:
+        if new_idx == 1:
             cleanup_w.activate()
-        elif "Shift" in new_text:
+        elif new_idx == 2:
             shift_w.activate()
 
-        prev_tab[0] = index
+        _current_tab[0] = new_idx
 
-    def _connect_tab_bar():
+    # Mechanism 1: dock visibilityChanged
+    dock_load.visibilityChanged.connect(lambda v: v and _do_transition(0))
+    dock_cleanup.visibilityChanged.connect(lambda v: v and _do_transition(1))
+    dock_shift.visibilityChanged.connect(lambda v: v and _do_transition(2))
+
+    # Mechanism 2: QTabBar.currentChanged (retries until found)
+    _tab_bar_connected = [False]
+
+    def _on_tab_bar_changed(index, tab_bar):
+        text = tab_bar.tabText(index)
+        if "Load" in text:
+            _do_transition(0)
+        elif "Cleanup" in text:
+            _do_transition(1)
+        elif "Shift" in text:
+            _do_transition(2)
+
+    def _try_connect_tab_bar():
+        if _tab_bar_connected[0]:
+            return
         qt_window = viewer.window._qt_window
         for tb in qt_window.findChildren(QTabBar):
             tab_texts = [tb.tabText(i) for i in range(tb.count())]
             if any("Load" in t for t in tab_texts):
-                tb.currentChanged.connect(lambda idx, _tb=tb: _on_tab_changed(idx, _tb))
-                break
+                tb.currentChanged.connect(
+                    lambda idx, _tb=tb: _on_tab_bar_changed(idx, _tb)
+                )
+                _tab_bar_connected[0] = True
+                print(f"[maskAnnotate] Connected to QTabBar: {tab_texts}")
+                return
+        # Not found yet — retry
+        print("[maskAnnotate] QTabBar not found, retrying in 500 ms...")
+        QTimer.singleShot(500, _try_connect_tab_bar)
 
-    QTimer.singleShot(0, _connect_tab_bar)
+    # Arm the ready gate and start QTabBar search after the event loop begins
+    def _on_event_loop_ready():
+        _ready[0] = True
+        _try_connect_tab_bar()
+
+    QTimer.singleShot(0, _on_event_loop_ready)
 
     napari.run()
 
