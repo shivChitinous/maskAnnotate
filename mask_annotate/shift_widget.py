@@ -1,0 +1,327 @@
+from qtpy.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QComboBox, QSpinBox, QSlider, QFileDialog, QGroupBox,
+    QProgressBar, QApplication,
+)
+from qtpy.QtCore import Qt
+import numpy as np
+
+from .shift_model import ShiftModel
+
+
+class ShiftWidget(QWidget):
+    """Stage 3: Per-timepoint, per-plane mask shifting."""
+
+    def __init__(self, data_manager, viewer_manager, parent=None):
+        super().__init__(parent)
+        self.data_manager = data_manager
+        self.viewer_manager = viewer_manager
+        self.shift_model = None
+
+        self._updating_ui = False  # guard against feedback loops
+        self._dims_connected = False
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # --- Reference selection ---
+        ref_group = QGroupBox("Reference Stack")
+        ref_layout = QVBoxLayout(ref_group)
+        self.combo_stack = QComboBox()
+        self.combo_stack.currentTextChanged.connect(self._on_stack_changed)
+        ref_layout.addWidget(self.combo_stack)
+        layout.addWidget(ref_group)
+
+        # --- Time navigation ---
+        time_group = QGroupBox("Time Navigation")
+        time_layout = QVBoxLayout(time_group)
+
+        slider_row = QHBoxLayout()
+        self.time_slider = QSlider(Qt.Horizontal)
+        self.time_slider.setMinimum(0)
+        self.time_slider.valueChanged.connect(self._on_time_changed)
+        slider_row.addWidget(self.time_slider)
+
+        self.time_spinbox = QSpinBox()
+        self.time_spinbox.setMinimum(0)
+        self.time_spinbox.valueChanged.connect(self._on_time_spinbox_changed)
+        slider_row.addWidget(self.time_spinbox)
+        time_layout.addLayout(slider_row)
+
+        self.time_label = QLabel("t = 0")
+        time_layout.addWidget(self.time_label)
+        layout.addWidget(time_group)
+
+        # --- Plane & shift controls ---
+        shift_group = QGroupBox("Plane Shift (pixels)")
+        shift_layout = QVBoxLayout(shift_group)
+
+        self.plane_label = QLabel("Plane: 0")
+        shift_layout.addWidget(self.plane_label)
+
+        dx_row = QHBoxLayout()
+        dx_row.addWidget(QLabel("X Shift:"))
+        self.dx_slider = QSlider(Qt.Horizontal)
+        self.dx_slider.setRange(-50, 50)
+        self.dx_slider.setValue(0)
+        self.dx_slider.valueChanged.connect(self._on_shift_changed)
+        dx_row.addWidget(self.dx_slider)
+        self.dx_label = QLabel("0")
+        self.dx_label.setMinimumWidth(30)
+        dx_row.addWidget(self.dx_label)
+        shift_layout.addLayout(dx_row)
+
+        dy_row = QHBoxLayout()
+        dy_row.addWidget(QLabel("Y Shift:"))
+        self.dy_slider = QSlider(Qt.Horizontal)
+        self.dy_slider.setRange(-50, 50)
+        self.dy_slider.setValue(0)
+        self.dy_slider.valueChanged.connect(self._on_shift_changed)
+        dy_row.addWidget(self.dy_slider)
+        self.dy_label = QLabel("0")
+        self.dy_label.setMinimumWidth(30)
+        dy_row.addWidget(self.dy_label)
+        shift_layout.addLayout(dy_row)
+
+        layout.addWidget(shift_group)
+
+        # --- Bulk actions ---
+        actions_group = QGroupBox("Actions")
+        actions_layout = QVBoxLayout(actions_group)
+
+        self.btn_copy_all_t = QPushButton("Copy shift to all timepoints (this plane)")
+        self.btn_copy_all_t.clicked.connect(self._on_copy_all_timepoints)
+        actions_layout.addWidget(self.btn_copy_all_t)
+
+        self.btn_copy_all_p = QPushButton("Copy shift to all planes (this timepoint)")
+        self.btn_copy_all_p.clicked.connect(self._on_copy_all_planes)
+        actions_layout.addWidget(self.btn_copy_all_p)
+
+        self.btn_adopt_edit = QPushButton("Save plane edit to base mask")
+        self.btn_adopt_edit.clicked.connect(self._on_adopt_edit)
+        actions_layout.addWidget(self.btn_adopt_edit)
+
+        self.btn_reset = QPushButton("Reset all shifts")
+        self.btn_reset.clicked.connect(self._on_reset)
+        actions_layout.addWidget(self.btn_reset)
+
+        layout.addWidget(actions_group)
+
+        # --- Save ---
+        save_group = QGroupBox("Save")
+        save_layout = QVBoxLayout(save_group)
+
+        self.btn_save = QPushButton("Save 4D Mask...")
+        self.btn_save.clicked.connect(self._on_save)
+        save_layout.addWidget(self.btn_save)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        save_layout.addWidget(self.progress)
+
+        self.status_label = QLabel("")
+        save_layout.addWidget(self.status_label)
+
+        layout.addWidget(save_group)
+        layout.addStretch()
+
+    def activate(self):
+        """Called when this stage becomes active."""
+        self.combo_stack.blockSignals(True)
+        self.combo_stack.clear()
+        names = self.data_manager.get_stack_names()
+        self.combo_stack.addItems(names)
+        # Default to stackMC if available
+        mc_idx = next((i for i, n in enumerate(names) if "mc" in n.lower()), 0)
+        self.combo_stack.setCurrentIndex(mc_idx)
+        self.combo_stack.blockSignals(False)
+
+        stack_name = self.combo_stack.currentText()
+        if not stack_name or self.data_manager.mask is None:
+            return
+
+        n_t = self.data_manager.get_n_timepoints(stack_name)
+
+        # Only create a new shift model if we don't have one, or the mask/timepoints changed
+        if (self.shift_model is None
+                or n_t != self.shift_model.n_timepoints
+                or not np.array_equal(self.shift_model.base_mask, self.data_manager.mask)):
+            self.shift_model = ShiftModel(self.data_manager.mask, n_t)
+
+        self.time_slider.setMaximum(n_t - 1)
+        self.time_spinbox.setMaximum(n_t - 1)
+
+        # Connect to napari dims event for plane tracking (only once)
+        if not self._dims_connected:
+            self.viewer_manager.viewer.dims.events.current_step.connect(
+                self._on_plane_changed
+            )
+            self._dims_connected = True
+
+        self._display_current(auto_contrast=True)
+
+    def _current_time(self):
+        return self.time_slider.value()
+
+    def _current_plane(self):
+        return self.viewer_manager.get_current_plane()
+
+    def _on_stack_changed(self):
+        """Reference stack changed — reinitialize and redisplay."""
+        stack_name = self.combo_stack.currentText()
+        if not stack_name or self.shift_model is None:
+            return
+        n_t = self.data_manager.get_n_timepoints(stack_name)
+        self.time_slider.setMaximum(n_t - 1)
+        self.time_spinbox.setMaximum(n_t - 1)
+        # Reinitialize shift model if timepoint count changed
+        if n_t != self.shift_model.n_timepoints:
+            self.shift_model = ShiftModel(self.data_manager.mask, n_t)
+        self._display_current(auto_contrast=True)
+
+    def _on_time_changed(self, t):
+        self._updating_ui = True
+        self.time_spinbox.setValue(t)
+        self._updating_ui = False
+        self.time_label.setText(f"t = {t}")
+        self._display_current()
+
+    def _on_time_spinbox_changed(self, t):
+        if not self._updating_ui:
+            self.time_slider.setValue(t)
+
+    def _on_plane_changed(self, event=None):
+        """napari dims changed — update shift spinboxes for the new plane."""
+        self._update_shift_spinboxes()
+
+    def _on_shift_changed(self):
+        """User changed dx or dy spinbox — store and redisplay."""
+        if self._updating_ui or self.shift_model is None:
+            return
+        t = self._current_time()
+        p = self._current_plane()
+        dx = self.dx_slider.value()
+        dy = self.dy_slider.value()
+        self.dx_label.setText(str(dx))
+        self.dy_label.setText(str(dy))
+        self.shift_model.set_shift(t, p, dx, dy)
+        self._display_mask()
+
+    def _on_copy_all_timepoints(self):
+        if self.shift_model is None:
+            return
+        p = self._current_plane()
+        dx = self.dx_slider.value()
+        dy = self.dy_slider.value()
+        self.shift_model.set_shift_all_timepoints(p, dx, dy)
+        self.status_label.setText(
+            f"Copied shift ({dx}, {dy}) to all timepoints for plane {p}"
+        )
+
+    def _on_copy_all_planes(self):
+        if self.shift_model is None:
+            return
+        t = self._current_time()
+        dx = self.dx_slider.value()
+        dy = self.dy_slider.value()
+        self.shift_model.set_shift_all_planes(t, dx, dy)
+        self._display_mask()
+        self.status_label.setText(
+            f"Copied shift ({dx}, {dy}) to all planes for timepoint {t}"
+        )
+
+    def _on_adopt_edit(self):
+        """Read the current plane's labels from napari, un-shift, and store as new base mask."""
+        if self.shift_model is None:
+            return
+        t = self._current_time()
+        p = self._current_plane()
+        # Read what's currently displayed (user's edits included)
+        edited_labels = self.viewer_manager.get_labels_data("mask")
+        if edited_labels is None:
+            return
+        edited_plane = edited_labels[p]
+        # Un-shift to get back to base mask space
+        dx, dy = self.shift_model.get_shift(t, p)
+        unshifted = self.shift_model._shift_plane(edited_plane, -dx, -dy)
+        # Update the base mask for this plane
+        self.shift_model.base_mask[p] = unshifted
+        # Also update data_manager's mask so it persists if saved
+        self.data_manager.mask[p] = unshifted
+        self.status_label.setText(
+            f"Plane {p} edit saved to base mask (will apply across all timepoints)"
+        )
+
+    def _on_reset(self):
+        if self.shift_model is None:
+            return
+        self.shift_model.reset_all()
+        self._update_shift_spinboxes()
+        self._display_mask()
+        self.status_label.setText("All shifts reset to (0, 0)")
+
+    def _display_current(self, auto_contrast=False):
+        """Load and display the current timepoint's image and shifted mask."""
+        stack_name = self.combo_stack.currentText()
+        if not stack_name or self.shift_model is None:
+            return
+
+        t = self._current_time()
+        img = self.data_manager.get_timepoint(stack_name, t)
+        self.viewer_manager.show_image(img, name="reference", auto_contrast=auto_contrast)
+        self._display_mask()
+        self._update_shift_spinboxes()
+
+    def _display_mask(self):
+        """Apply shifts and display the mask for the current timepoint."""
+        if self.shift_model is None:
+            return
+        t = self._current_time()
+        shifted = self.shift_model.apply_shifts_for_timepoint(t)
+        self.viewer_manager.show_labels(shifted, name="mask")
+
+    def _update_shift_spinboxes(self):
+        """Update spinbox values to reflect stored shifts for current (t, plane)."""
+        if self.shift_model is None:
+            return
+        t = self._current_time()
+        p = self._current_plane()
+        self.plane_label.setText(f"Plane: {p}")
+
+        self._updating_ui = True
+        dx, dy = self.shift_model.get_shift(t, p)
+        self.dx_slider.setValue(dx)
+        self.dy_slider.setValue(dy)
+        self.dx_label.setText(str(dx))
+        self.dy_label.setText(str(dy))
+        self._updating_ui = False
+
+    def _on_save(self):
+        if self.shift_model is None:
+            self.status_label.setText("No shift model — load data first")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save 4D Mask", "mask_4d.npy",
+            "NumPy files (*.npy);;All files (*)"
+        )
+        if not path:
+            return
+
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.btn_save.setEnabled(False)
+        self.status_label.setText("Generating 4D mask...")
+        QApplication.processEvents()
+
+        def update_progress(frac):
+            self.progress.setValue(int(frac * 100))
+            QApplication.processEvents()
+
+        shape = self.data_manager.save_mask_4d(
+            path, self.shift_model, callback=update_progress
+        )
+        self.progress.setVisible(False)
+        self.btn_save.setEnabled(True)
+        self.status_label.setText(f"Saved {shape} to {path}")
