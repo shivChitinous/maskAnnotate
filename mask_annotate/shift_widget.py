@@ -5,6 +5,8 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt
 import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from .shift_model import ShiftModel
 
@@ -56,7 +58,7 @@ class ShiftWidget(QWidget):
         slider_row.addWidget(self.time_spinbox)
         time_layout.addLayout(slider_row)
 
-        self.time_label = QLabel("t = 0")
+        self.time_label = QLabel("timepoint = 0")
         time_layout.addWidget(self.time_label)
         layout.addWidget(time_group)
 
@@ -64,11 +66,11 @@ class ShiftWidget(QWidget):
         shift_group = QGroupBox("Plane Shift (pixels)")
         shift_layout = QVBoxLayout(shift_group)
 
-        self.plane_label = QLabel("Plane: 0")
+        self.plane_label = QLabel("plane: 0")
         shift_layout.addWidget(self.plane_label)
 
         dx_row = QHBoxLayout()
-        dx_row.addWidget(QLabel("X Shift:"))
+        dx_row.addWidget(QLabel("x shift:"))
         self.dx_slider = QSlider(Qt.Horizontal)
         self.dx_slider.setRange(-50, 50)
         self.dx_slider.setValue(0)
@@ -80,7 +82,7 @@ class ShiftWidget(QWidget):
         shift_layout.addLayout(dx_row)
 
         dy_row = QHBoxLayout()
-        dy_row.addWidget(QLabel("Y Shift:"))
+        dy_row.addWidget(QLabel("y shift:"))
         self.dy_slider = QSlider(Qt.Horizontal)
         self.dy_slider.setRange(-50, 50)
         self.dy_slider.setValue(0)
@@ -104,6 +106,10 @@ class ShiftWidget(QWidget):
         self.btn_copy_all_p = QPushButton("Copy shift to all planes (this timepoint)")
         self.btn_copy_all_p.clicked.connect(self._on_copy_all_planes)
         actions_layout.addWidget(self.btn_copy_all_p)
+
+        self.btn_copy_all_tp = QPushButton("Copy shift to all planes and timepoints")
+        self.btn_copy_all_tp.clicked.connect(self._on_copy_all_planes_timepoints)
+        actions_layout.addWidget(self.btn_copy_all_tp)
 
         self.btn_adopt_edit = QPushButton("Save plane edit to base mask")
         self.btn_adopt_edit.clicked.connect(self._on_adopt_edit)
@@ -142,6 +148,22 @@ class ShiftWidget(QWidget):
         range_layout.addLayout(range_btn_row)
 
         layout.addWidget(range_group)
+
+        # --- Shift overview (line plot) ---
+        heatmap_group = QGroupBox("Shift Overview")
+        heatmap_layout = QVBoxLayout(heatmap_group)
+
+        self._heatmap_fig = Figure(figsize=(4, 1.5), dpi=100, facecolor="black")
+        self._heatmap_fig.set_tight_layout(True)
+        self._heatmap_ax = self._heatmap_fig.add_subplot(111)
+        self._heatmap_ax.set_facecolor("black")
+        self._heatmap_canvas = FigureCanvas(self._heatmap_fig)
+        self._heatmap_canvas.setFixedHeight(180)
+        self._line_handles = None
+        self._heatmap_vline = None
+
+        heatmap_layout.addWidget(self._heatmap_canvas)
+        layout.addWidget(heatmap_group)
 
         # --- Save ---
         save_group = QGroupBox("Save")
@@ -183,6 +205,7 @@ class ShiftWidget(QWidget):
                 or n_t != self.shift_model.n_timepoints
                 or not np.array_equal(self.shift_model.base_mask, self.data_manager.mask)):
             self.shift_model = ShiftModel(self.data_manager.mask, n_t)
+            self._reset_heatmap()
 
         self.time_slider.setMaximum(n_t - 1)
         self.time_spinbox.setMaximum(n_t - 1)
@@ -195,6 +218,7 @@ class ShiftWidget(QWidget):
             self._dims_connected = True
 
         self._display_current(auto_contrast=True)
+        self._update_heatmap()
 
     def _current_time(self):
         return self.time_slider.value()
@@ -213,14 +237,17 @@ class ShiftWidget(QWidget):
         # Reinitialize shift model if timepoint count changed
         if n_t != self.shift_model.n_timepoints:
             self.shift_model = ShiftModel(self.data_manager.mask, n_t)
+            self._reset_heatmap()
         self._display_current(auto_contrast=True)
+        self._update_heatmap()
 
     def _on_time_changed(self, t):
         self._updating_ui = True
         self.time_spinbox.setValue(t)
         self._updating_ui = False
-        self.time_label.setText(f"t = {t}")
+        self.time_label.setText(f"timepoint = {t}")
         self._display_current()
+        self._update_time_marker()
 
     def _on_time_spinbox_changed(self, t):
         if not self._updating_ui:
@@ -229,6 +256,7 @@ class ShiftWidget(QWidget):
     def _on_plane_changed(self, event=None):
         """napari dims changed — update shift spinboxes for the new plane."""
         self._update_shift_spinboxes()
+        self._update_time_marker()
 
     def _on_shift_changed(self):
         """User changed dx or dy spinbox — store and redisplay."""
@@ -242,6 +270,7 @@ class ShiftWidget(QWidget):
         self.dy_label.setText(str(dy))
         self.shift_model.set_shift(t, p, dx, dy)
         self._display_mask()
+        self._update_heatmap()
 
     def _on_copy_all_timepoints(self):
         if self.shift_model is None:
@@ -253,6 +282,7 @@ class ShiftWidget(QWidget):
         self.status_label.setText(
             f"Copied shift ({dx}, {dy}) to all timepoints for plane {p}"
         )
+        self._update_heatmap()
 
     def _on_copy_all_planes(self):
         if self.shift_model is None:
@@ -265,6 +295,19 @@ class ShiftWidget(QWidget):
         self.status_label.setText(
             f"Copied shift ({dx}, {dy}) to all planes for timepoint {t}"
         )
+        self._update_heatmap()
+
+    def _on_copy_all_planes_timepoints(self):
+        if self.shift_model is None:
+            return
+        dx = self.dx_slider.value()
+        dy = self.dy_slider.value()
+        self.shift_model.shifts[:, :] = [dx, dy]
+        self._display_mask()
+        self.status_label.setText(
+            f"Copied shift ({dx}, {dy}) to all planes and timepoints"
+        )
+        self._update_heatmap()
 
     def _on_adopt_edit(self):
         """Read the current plane's labels from napari, un-shift, and store as new base mask."""
@@ -295,6 +338,7 @@ class ShiftWidget(QWidget):
         self._update_shift_spinboxes()
         self._display_mask()
         self.status_label.setText("All shifts reset to (0, 0)")
+        self._update_heatmap()
 
     def _on_anchor(self):
         """Record the current timepoint, plane, and shift as anchor."""
@@ -339,6 +383,7 @@ class ShiftWidget(QWidget):
         self._clear_anchor()
         self._display_mask()
         self._update_shift_spinboxes()
+        self._update_heatmap()
 
     def _on_range_cancel(self):
         """Cancel the anchored range apply."""
@@ -367,6 +412,7 @@ class ShiftWidget(QWidget):
         self.viewer_manager.show_image(img, name="reference", auto_contrast=auto_contrast)
         self._display_mask()
         self._update_shift_spinboxes()
+        self._update_time_marker()
 
     def _display_mask(self):
         """Apply shifts and display the mask for the current timepoint.
@@ -401,7 +447,7 @@ class ShiftWidget(QWidget):
             return
         t = self._current_time()
         p = self._current_plane()
-        self.plane_label.setText(f"Plane: {p}")
+        self.plane_label.setText(f"plane: {p}")
 
         self._updating_ui = True
         dx, dy = self.shift_model.get_shift(t, p)
@@ -410,6 +456,92 @@ class ShiftWidget(QWidget):
         self.dx_label.setText(str(dx))
         self.dy_label.setText(str(dy))
         self._updating_ui = False
+
+    # ---- Heatmap helpers ------------------------------------------------
+
+    def _reset_heatmap(self):
+        """Invalidate cached line-plot objects so next update does a full redraw."""
+        self._line_handles = None
+        self._heatmap_vline = None
+        self._heatmap_ax.clear()
+
+    def _update_heatmap(self):
+        """Recompute shift magnitudes and redraw the per-plane line plot."""
+        if self.shift_model is None:
+            return
+
+        import matplotlib.cm as cm
+        from matplotlib.ticker import MaxNLocator
+
+        shifts = self.shift_model.shifts.astype(np.float32)
+        # magnitudes shape: (n_timepoints, n_planes)
+        magnitudes = np.sqrt(shifts[:, :, 0] ** 2 + shifts[:, :, 1] ** 2)
+        n_planes = magnitudes.shape[1]
+        cur_plane = self._current_plane()
+
+        ax = self._heatmap_ax
+        viridis = cm.get_cmap("viridis", n_planes)
+
+        if self._line_handles is None:
+            ax.clear()
+            ax.set_facecolor("black")
+
+            self._line_handles = []
+            for p in range(n_planes):
+                color = viridis(p / max(n_planes - 1, 1))
+                is_cur = (p == cur_plane)
+                lw = 2.0 if is_cur else 1.0
+                alpha = 1.0 if is_cur else 0.5
+                line, = ax.plot(
+                    magnitudes[:, p],
+                    color=color,
+                    linewidth=lw,
+                    alpha=alpha,
+                )
+                self._line_handles.append(line)
+
+            ax.set_xlabel("timepoint", fontsize=8, color="white")
+            ax.set_ylabel("shift (px)", fontsize=8, color="white")
+            ax.tick_params(labelsize=7, colors="white")
+            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+            for spine in ax.spines.values():
+                spine.set_color("white")
+
+            t = self._current_time()
+            self._heatmap_vline = ax.axvline(
+                x=t, color="red", linewidth=1.0, linestyle="--"
+            )
+        else:
+            for p, line in enumerate(self._line_handles):
+                line.set_ydata(magnitudes[:, p])
+
+        # Adjust y-axis range
+        max_mag = magnitudes.max()
+        ax.set_ylim(0, max(max_mag * 1.1, 1.0))
+
+        self._heatmap_canvas.draw_idle()
+
+    def _update_time_marker(self):
+        """Move the time marker and update plane highlighting."""
+        if self._heatmap_vline is None:
+            return
+        t = self._current_time()
+        self._heatmap_vline.set_xdata([t, t])
+
+        # Update line highlighting for current plane
+        if self._line_handles is not None:
+            cur_plane = self._current_plane()
+            for p, line in enumerate(self._line_handles):
+                if p == cur_plane:
+                    line.set_linewidth(2.0)
+                    line.set_alpha(1.0)
+                else:
+                    line.set_linewidth(1.0)
+                    line.set_alpha(0.5)
+
+        self._heatmap_canvas.draw_idle()
+
+    # ---- Save ----------------------------------------------------------
 
     def _on_save(self):
         if self.shift_model is None:
