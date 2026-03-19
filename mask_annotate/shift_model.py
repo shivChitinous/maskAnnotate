@@ -14,7 +14,8 @@ class ShiftModel:
         Parameters
         ----------
         base_mask : np.ndarray, shape (n_planes, h, w)
-            The cleaned 3D mask from Stage 2.
+            The cleaned 3D mask from Stage 2. Used as the default for all
+            timepoints that have not been individually edited.
         n_timepoints : int
             Number of time points in the 4D stack.
         """
@@ -23,6 +24,10 @@ class ShiftModel:
         self.n_planes = base_mask.shape[0]
         # shifts[t, p] = (dx, dy) as integer pixel shifts
         self.shifts = np.zeros((n_timepoints, self.n_planes, 2), dtype=np.int16)
+        # Sparse per-(timepoint, plane) mask overrides, keyed by (t, p).
+        # Only the specific planes actually edited are stored.
+        # Falls back to base_mask[p] for any (t, p) not present.
+        self._plane_masks: dict = {}
 
     def set_shift(self, t, plane, dx, dy):
         self.shifts[t, plane] = [dx, dy]
@@ -48,15 +53,30 @@ class ShiftModel:
         """Zero out all shifts."""
         self.shifts[:] = 0
 
-    def apply_shifts_for_timepoint(self, t):
-        """Apply stored shifts to the base mask for a single timepoint.
+    def set_plane_mask(self, t, p, plane_2d):
+        """Store a user-edited 2D plane for a specific (timepoint, plane).
 
+        plane_2d must already be un-shifted (in base-mask space).
+        Falls back to base_mask[p] for any (t, p) not set here.
+        """
+        self._plane_masks[(t, p)] = np.asarray(plane_2d, dtype=np.int32)
+
+    def clear_timepoint(self, t):
+        """Remove all per-plane overrides for timepoint t (revert to base_mask)."""
+        for p in range(self.n_planes):
+            self._plane_masks.pop((t, p), None)
+
+    def apply_shifts_for_timepoint(self, t):
+        """Apply stored shifts to the mask for a single timepoint.
+
+        Per-(t, p) overrides take priority over base_mask[p].
         Returns np.ndarray of shape (n_planes, h, w).
         """
         result = np.empty_like(self.base_mask)
         for p in range(self.n_planes):
+            base_plane = self._plane_masks.get((t, p), self.base_mask[p])
             dx, dy = self.get_shift(t, p)
-            result[p] = self._shift_plane(self.base_mask[p], dx, dy)
+            result[p] = self._shift_plane(base_plane, dx, dy)
         return result
 
     @staticmethod
@@ -87,7 +107,7 @@ class ShiftModel:
         np.ndarray of shape (n_timepoints, n_planes, h, w)
         """
         h, w = self.base_mask.shape[1], self.base_mask.shape[2]
-        mask_4d = np.empty(
+        mask_4d = np.zeros(
             (self.n_timepoints, self.n_planes, h, w), dtype=self.base_mask.dtype
         )
         for t in range(self.n_timepoints):

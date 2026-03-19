@@ -23,6 +23,10 @@ class ShiftWidget(QWidget):
         self._updating_ui = False  # guard against feedback loops
         self._dims_connected = False
 
+        self._our_update = False          # True while we write to the labels layer
+        self._pending_label_sync = False  # True when user has edited labels
+        self._label_event_connected = False
+
         # Range-apply anchor state
         self._anchor_t = None
         self._anchor_dx = None
@@ -95,31 +99,55 @@ class ShiftWidget(QWidget):
 
         layout.addWidget(shift_group)
 
-        # --- Bulk actions ---
-        actions_group = QGroupBox("Actions")
-        actions_layout = QVBoxLayout(actions_group)
+        # --- Shift actions ---
+        shift_act_group = QGroupBox("Shift Actions")
+        shift_act_layout = QVBoxLayout(shift_act_group)
 
         self.btn_copy_all_t = QPushButton("Copy shift to all timepoints (this plane)")
         self.btn_copy_all_t.clicked.connect(self._on_copy_all_timepoints)
-        actions_layout.addWidget(self.btn_copy_all_t)
+        shift_act_layout.addWidget(self.btn_copy_all_t)
 
         self.btn_copy_all_p = QPushButton("Copy shift to all planes (this timepoint)")
         self.btn_copy_all_p.clicked.connect(self._on_copy_all_planes)
-        actions_layout.addWidget(self.btn_copy_all_p)
+        shift_act_layout.addWidget(self.btn_copy_all_p)
 
         self.btn_copy_all_tp = QPushButton("Copy shift to all planes and timepoints")
         self.btn_copy_all_tp.clicked.connect(self._on_copy_all_planes_timepoints)
-        actions_layout.addWidget(self.btn_copy_all_tp)
-
-        self.btn_adopt_edit = QPushButton("Save plane edit to base mask")
-        self.btn_adopt_edit.clicked.connect(self._on_adopt_edit)
-        actions_layout.addWidget(self.btn_adopt_edit)
+        shift_act_layout.addWidget(self.btn_copy_all_tp)
 
         self.btn_reset = QPushButton("Reset all shifts")
         self.btn_reset.clicked.connect(self._on_reset)
-        actions_layout.addWidget(self.btn_reset)
+        shift_act_layout.addWidget(self.btn_reset)
 
-        layout.addWidget(actions_group)
+        layout.addWidget(shift_act_group)
+
+        # --- Edit actions ---
+        edit_act_group = QGroupBox("Edit Actions")
+        edit_act_layout = QVBoxLayout(edit_act_group)
+
+        self.btn_adopt_edit = QPushButton("Save plane edit")
+        self.btn_adopt_edit.clicked.connect(self._on_adopt_edit)
+        edit_act_layout.addWidget(self.btn_adopt_edit)
+
+        self.btn_copy_edit_all_p = QPushButton("Copy edits to all planes (this timepoint)")
+        self.btn_copy_edit_all_p.clicked.connect(self._on_copy_edit_all_planes)
+        edit_act_layout.addWidget(self.btn_copy_edit_all_p)
+
+        self.btn_reset_to_base = QPushButton("Reset to base mask")
+        self.btn_reset_to_base.clicked.connect(self._on_reset_to_base)
+        edit_act_layout.addWidget(self.btn_reset_to_base)
+
+        layout.addWidget(edit_act_group)
+
+        # --- Other actions ---
+        other_act_group = QGroupBox("Other Actions")
+        other_act_layout = QVBoxLayout(other_act_group)
+
+        self.btn_push_to_base = QPushButton("Push to base mask")
+        self.btn_push_to_base.clicked.connect(self._on_push_to_base)
+        other_act_layout.addWidget(self.btn_push_to_base)
+
+        layout.addWidget(other_act_group)
 
         # --- Range apply ---
         range_group = QGroupBox("Range Apply")
@@ -206,6 +234,10 @@ class ShiftWidget(QWidget):
                 or not np.array_equal(self.shift_model.base_mask, self.data_manager.mask)):
             self.shift_model = ShiftModel(self.data_manager.mask, n_t)
             self._reset_heatmap()
+
+        # Re-hook label events in case the labels layer was recreated
+        self._label_event_connected = False
+        self._pending_label_sync = False
 
         self.time_slider.setMaximum(n_t - 1)
         self.time_spinbox.setMaximum(n_t - 1)
@@ -310,26 +342,65 @@ class ShiftWidget(QWidget):
         self._update_heatmap()
 
     def _on_adopt_edit(self):
-        """Read the current plane's labels from napari, un-shift, and store as new base mask."""
+        """Sync current napari edits into the per-timepoint mask store."""
+        if self.shift_model is None:
+            return
+        self._pending_label_sync = True   # force sync even if flag wasn't set
+        self._sync_user_edits()
+        t = self._current_time()
+        p = self._current_plane()
+        self.status_label.setText(
+            f"Edits at timepoint {t} saved (plane {p} and all other planes)"
+        )
+
+    def _on_copy_edit_all_planes(self):
+        """Copy the current plane's edited mask to all planes at this timepoint."""
+        if self.shift_model is None:
+            return
+        self._pending_label_sync = True
+        self._sync_user_edits()
+        t = self._current_time()
+        p = self._current_plane()
+        src = self.shift_model._plane_masks.get(
+            (t, p), self.shift_model.base_mask[p]
+        )
+        for p2 in range(self.shift_model.n_planes):
+            self.shift_model.set_plane_mask(t, p2, src)
+        self._display_mask()
+        self.status_label.setText(
+            f"plane {p} edits copied to all planes at timepoint {t}"
+        )
+
+    def _on_push_to_base(self):
+        """Write all edited planes at this timepoint into base_mask.
+
+        Each plane's override (or base_mask fallback) becomes the new base,
+        affecting all timepoints that have no individual (t, p) override.
+        """
+        if self.shift_model is None:
+            return
+        self._pending_label_sync = True
+        self._sync_user_edits()
+        t = self._current_time()
+        for p in range(self.shift_model.n_planes):
+            src = self.shift_model._plane_masks.get(
+                (t, p), self.shift_model.base_mask[p]
+            )
+            self.shift_model.base_mask[p] = src.copy()
+        self.data_manager.mask[:] = self.shift_model.base_mask
+        self.status_label.setText(
+            f"all planes at timepoint {t} pushed to base mask"
+        )
+
+    def _on_reset_to_base(self):
+        """Remove all per-plane overrides for this timepoint, reverting to base_mask."""
         if self.shift_model is None:
             return
         t = self._current_time()
-        p = self._current_plane()
-        # Read what's currently displayed (user's edits included)
-        edited_labels = self.viewer_manager.get_labels_data("mask")
-        if edited_labels is None:
-            return
-        edited_plane = edited_labels[p]
-        # Un-shift to get back to base mask space
-        dx, dy = self.shift_model.get_shift(t, p)
-        unshifted = self.shift_model._shift_plane(edited_plane, -dx, -dy)
-        # Update the base mask for this plane
-        self.shift_model.base_mask[p] = unshifted
-        # Also update data_manager's mask so it persists if saved
-        self.data_manager.mask[p] = unshifted
-        self.status_label.setText(
-            f"Plane {p} edit saved to base mask (will apply across all timepoints)"
-        )
+        self.shift_model.clear_timepoint(t)
+        self._pending_label_sync = False
+        self._display_mask()
+        self.status_label.setText(f"timepoint {t} reset to base mask")
 
     def _on_reset(self):
         if self.shift_model is None:
@@ -414,12 +485,57 @@ class ShiftWidget(QWidget):
         self._update_shift_spinboxes()
         self._update_time_marker()
 
+    # ---- Label-edit sync ------------------------------------------------
+
+    def _connect_label_events(self):
+        """Connect to the napari labels layer's data event (once per layer)."""
+        if self._label_event_connected:
+            return
+        try:
+            layer = self.viewer_manager.viewer.layers["mask"]
+            layer.events.data.connect(self._on_labels_edited)
+            self._label_event_connected = True
+        except KeyError:
+            pass
+
+    def _on_labels_edited(self, event=None):
+        """Called by napari when the labels layer data changes."""
+        if not self._our_update:
+            self._pending_label_sync = True
+
+    def _sync_user_edits(self):
+        """Read back user edits from napari and store sparse per-(t, p) overrides.
+
+        Only runs when _pending_label_sync is True (i.e., the user actually
+        painted or erased since the last display). Only planes that differ
+        from base_mask are stored, keeping memory usage minimal.
+        """
+        if not self._pending_label_sync or self.shift_model is None:
+            return
+        edited = self.viewer_manager.get_labels_data("mask")
+        if edited is None:
+            return
+        t = self._current_time()
+        for p in range(self.shift_model.n_planes):
+            dx, dy = self.shift_model.get_shift(t, p)
+            unshifted = self.shift_model._shift_plane(edited[p], -dx, -dy)
+            if not np.array_equal(unshifted, self.shift_model.base_mask[p]):
+                self.shift_model.set_plane_mask(t, p, unshifted)
+            # If equal to base, leave any existing override in place rather than
+            # silently clearing it (user may have painted then un-painted)
+        self._pending_label_sync = False
+
+    # ---- Mask display ---------------------------------------------------
+
     def _display_mask(self):
         """Apply shifts and display the mask for the current timepoint.
 
+        Syncs any user edits first so they are preserved before overwriting.
         While an anchor is active, previews the anchored shift on the
         relevant plane(s) so the user can see where the mask will land.
         """
+        self._sync_user_edits()
+
         if self.shift_model is None:
             return
         t = self._current_time()
@@ -430,16 +546,21 @@ class ShiftWidget(QWidget):
             dx, dy = self._anchor_dx, self._anchor_dy
             if self.chk_all_planes.isChecked():
                 for p in range(self.shift_model.n_planes):
-                    shifted[p] = self.shift_model._shift_plane(
-                        self.shift_model.base_mask[p], dx, dy
+                    base_p = self.shift_model._plane_masks.get(
+                        (t, p), self.shift_model.base_mask[p]
                     )
+                    shifted[p] = self.shift_model._shift_plane(base_p, dx, dy)
             else:
                 p = self._anchor_plane
-                shifted[p] = self.shift_model._shift_plane(
-                    self.shift_model.base_mask[p], dx, dy
+                base_p = self.shift_model._plane_masks.get(
+                    (t, p), self.shift_model.base_mask[p]
                 )
+                shifted[p] = self.shift_model._shift_plane(base_p, dx, dy)
 
+        self._our_update = True
         self.viewer_manager.show_labels(shifted, name="mask")
+        self._our_update = False
+        self._connect_label_events()
 
     def _update_shift_spinboxes(self):
         """Update spinbox values to reflect stored shifts for current (t, plane)."""

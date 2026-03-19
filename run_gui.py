@@ -9,8 +9,8 @@ if os.path.isdir(_env_plugins) and "QT_PLUGIN_PATH" not in os.environ:
     os.environ["QT_PLUGIN_PATH"] = _env_plugins
 
 import napari
-from qtpy.QtCore import QTimer
-from qtpy.QtWidgets import QTabBar
+from qtpy.QtCore import Qt, QTimer
+from qtpy.QtWidgets import QScrollArea, QTabBar, QTabWidget
 
 from mask_annotate.data_manager import DataManager
 from mask_annotate.viewer_manager import ViewerManager
@@ -24,19 +24,32 @@ def main():
     data_mgr = DataManager()
     view_mgr = ViewerManager(viewer)
 
-    # Create stage widgets
+    # Create stage widgets, each wrapped in a scroll area so tall content
+    # never overflows the dock panel regardless of screen height.
+    def _scrollable(widget):
+        sa = QScrollArea()
+        sa.setWidget(widget)
+        sa.setWidgetResizable(True)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return sa
+
     load_w = LoadWidget(data_mgr)
     cleanup_w = CleanupWidget(data_mgr, view_mgr)
     shift_w = ShiftWidget(data_mgr, view_mgr)
 
     # Dock each widget individually, then tabify them
-    dock_load = viewer.window.add_dock_widget(load_w, name="1. Load", area="right")
-    dock_cleanup = viewer.window.add_dock_widget(cleanup_w, name="2. Cleanup", area="right")
-    dock_shift = viewer.window.add_dock_widget(shift_w, name="3. Shift", area="right")
+    dock_load = viewer.window.add_dock_widget(_scrollable(load_w), name="1. Load", area="right")
+    dock_cleanup = viewer.window.add_dock_widget(_scrollable(cleanup_w), name="2. Cleanup", area="right")
+    dock_shift = viewer.window.add_dock_widget(_scrollable(shift_w), name="3. Shift", area="right")
 
     # Tabify so they share the same panel space
+    qt_win = viewer.window._qt_window
     viewer.window._qt_window.tabifyDockWidget(dock_load, dock_cleanup)
     viewer.window._qt_window.tabifyDockWidget(dock_cleanup, dock_shift)
+
+    # Move tabs to the top so they're always visible regardless of content height
+    qt_win.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.North)
+
     dock_load.raise_()  # Show the Load tab first
 
     # --- Tab-switch wiring ---
@@ -88,8 +101,7 @@ def main():
     def _try_connect_tab_bar():
         if _tab_bar_connected[0]:
             return
-        qt_window = viewer.window._qt_window
-        for tb in qt_window.findChildren(QTabBar):
+        for tb in qt_win.findChildren(QTabBar):
             tab_texts = [tb.tabText(i) for i in range(tb.count())]
             if any("Load" in t for t in tab_texts):
                 tb.currentChanged.connect(
