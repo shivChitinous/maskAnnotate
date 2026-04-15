@@ -1,7 +1,7 @@
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QSpinBox, QDoubleSpinBox, QSlider, QFileDialog, QGroupBox,
-    QProgressBar, QApplication, QCheckBox,
+    QProgressBar, QApplication, QListWidget,
 )
 from qtpy.QtCore import Qt, QTimer
 import numpy as np
@@ -32,11 +32,11 @@ class ShiftWidget(QWidget):
         self._pending_label_sync = False  # True when user has edited labels
         self._label_event_connected = False
 
-        # Range-apply anchor state
-        self._anchor_t = None
-        self._anchor_dx = None
-        self._anchor_dy = None
-        self._anchor_plane = None
+        # Drift correction anchor state
+        self._anchors: dict = {}       # plane → [(t, x, y), ...]
+        self._marking_active = False
+        self._points_layer = None
+        self._prev_n_points = 0
 
         self._build_ui()
 
@@ -81,64 +81,26 @@ class ShiftWidget(QWidget):
         time_layout.addLayout(rate_row)
 
         play_row = QHBoxLayout()
+        self.btn_play_10x = QPushButton("▶ 10×")
         self.btn_play_20x = QPushButton("▶ 20×")
         self.btn_play_40x = QPushButton("▶ 40×")
+        self.btn_play_10x.clicked.connect(lambda: self._on_play(10))
         self.btn_play_20x.clicked.connect(lambda: self._on_play(20))
         self.btn_play_40x.clicked.connect(lambda: self._on_play(40))
+        play_row.addWidget(self.btn_play_10x)
         play_row.addWidget(self.btn_play_20x)
         play_row.addWidget(self.btn_play_40x)
         time_layout.addLayout(play_row)
 
         layout.addWidget(time_group)
 
-        # --- Plane & shift controls ---
-        shift_group = QGroupBox("Plane Shift (pixels)")
-        shift_layout = QVBoxLayout(shift_group)
-
-        self.plane_label = QLabel("plane: 0")
-        shift_layout.addWidget(self.plane_label)
-
-        dx_row = QHBoxLayout()
-        dx_row.addWidget(QLabel("x shift:"))
-        self.dx_slider = QSlider(Qt.Horizontal)
-        self.dx_slider.setRange(-50, 50)
-        self.dx_slider.setValue(0)
-        self.dx_slider.valueChanged.connect(self._on_shift_changed)
-        dx_row.addWidget(self.dx_slider)
-        self.dx_label = QLabel("0")
-        self.dx_label.setMinimumWidth(30)
-        dx_row.addWidget(self.dx_label)
-        shift_layout.addLayout(dx_row)
-
-        dy_row = QHBoxLayout()
-        dy_row.addWidget(QLabel("y shift:"))
-        self.dy_slider = QSlider(Qt.Horizontal)
-        self.dy_slider.setRange(-50, 50)
-        self.dy_slider.setValue(0)
-        self.dy_slider.valueChanged.connect(self._on_shift_changed)
-        dy_row.addWidget(self.dy_slider)
-        self.dy_label = QLabel("0")
-        self.dy_label.setMinimumWidth(30)
-        dy_row.addWidget(self.dy_label)
-        shift_layout.addLayout(dy_row)
-
-        layout.addWidget(shift_group)
-
         # --- Shift actions ---
         shift_act_group = QGroupBox("Shift Actions")
         shift_act_layout = QVBoxLayout(shift_act_group)
 
-        self.btn_copy_all_t = QPushButton("Copy shift to all timepoints (this plane)")
-        self.btn_copy_all_t.clicked.connect(self._on_copy_all_timepoints)
-        shift_act_layout.addWidget(self.btn_copy_all_t)
-
-        self.btn_copy_all_p = QPushButton("Copy shift to all planes (this timepoint)")
-        self.btn_copy_all_p.clicked.connect(self._on_copy_all_planes)
-        shift_act_layout.addWidget(self.btn_copy_all_p)
-
-        self.btn_copy_all_tp = QPushButton("Copy shift to all planes and timepoints")
-        self.btn_copy_all_tp.clicked.connect(self._on_copy_all_planes_timepoints)
-        shift_act_layout.addWidget(self.btn_copy_all_tp)
+        self.btn_copy_plane_trace = QPushButton("Copy time trace to all planes")
+        self.btn_copy_plane_trace.clicked.connect(self._on_copy_plane_trace_to_all)
+        shift_act_layout.addWidget(self.btn_copy_plane_trace)
 
         self.btn_reset = QPushButton("Reset all shifts")
         self.btn_reset.clicked.connect(self._on_reset)
@@ -174,33 +136,48 @@ class ShiftWidget(QWidget):
 
         layout.addWidget(other_act_group)
 
-        # --- Range apply ---
-        range_group = QGroupBox("Range Apply")
-        range_layout = QVBoxLayout(range_group)
+        # --- Drift correction ---
+        drift_group = QGroupBox("Drift Correction")
+        drift_layout = QVBoxLayout(drift_group)
 
-        self.chk_all_planes = QCheckBox("All planes")
-        range_layout.addWidget(self.chk_all_planes)
+        drift_btn_row = QHBoxLayout()
+        self.btn_start_marking = QPushButton("Start marking")
+        self.btn_start_marking.clicked.connect(self._on_start_marking)
+        drift_btn_row.addWidget(self.btn_start_marking)
+        self.btn_clear_plane_anchors = QPushButton("Clear plane anchors")
+        self.btn_clear_plane_anchors.clicked.connect(self._on_clear_plane_anchors)
+        drift_btn_row.addWidget(self.btn_clear_plane_anchors)
+        drift_layout.addLayout(drift_btn_row)
 
-        self.btn_anchor = QPushButton("Anchor shift here")
-        self.btn_anchor.clicked.connect(self._on_anchor)
-        range_layout.addWidget(self.btn_anchor)
+        tau_row = QHBoxLayout()
+        tau_row.addWidget(QLabel("filter τ (s):"))
+        self.tau_spinbox = QDoubleSpinBox()
+        self.tau_spinbox.setRange(0.0, 120.0)
+        self.tau_spinbox.setDecimals(2)
+        self.tau_spinbox.setSingleStep(0.1)
+        self.tau_spinbox.setValue(0.5)
+        self.tau_spinbox.setToolTip(
+            "Time constant for backwards exponential smoothing.\n"
+            "0 = no filtering.  Increase to propagate each anchor\n"
+            "further back in time (compensates for click delay)."
+        )
+        self.tau_spinbox.valueChanged.connect(self._on_tau_changed)
+        tau_row.addWidget(self.tau_spinbox)
+        drift_layout.addLayout(tau_row)
 
-        self.range_status = QLabel("")
-        range_layout.addWidget(self.range_status)
+        self.anchor_status = QLabel("")
+        self.anchor_status.setWordWrap(True)
+        drift_layout.addWidget(self.anchor_status)
 
-        range_btn_row = QHBoxLayout()
-        self.btn_range_cancel = QPushButton("Cancel")
-        self.btn_range_cancel.setEnabled(False)
-        self.btn_range_cancel.clicked.connect(self._on_range_cancel)
-        range_btn_row.addWidget(self.btn_range_cancel)
+        self.anchor_list = QListWidget()
+        self.anchor_list.setMaximumHeight(100)
+        drift_layout.addWidget(self.anchor_list)
 
-        self.btn_range_apply = QPushButton("Apply range")
-        self.btn_range_apply.setEnabled(False)
-        self.btn_range_apply.clicked.connect(self._on_range_apply)
-        range_btn_row.addWidget(self.btn_range_apply)
-        range_layout.addLayout(range_btn_row)
+        self.btn_remove_anchor = QPushButton("Remove selected anchor")
+        self.btn_remove_anchor.clicked.connect(self._on_remove_anchor)
+        drift_layout.addWidget(self.btn_remove_anchor)
 
-        layout.addWidget(range_group)
+        layout.addWidget(drift_group)
 
         # --- Shift overview (line plot) ---
         heatmap_group = QGroupBox("Shift Overview")
@@ -239,6 +216,7 @@ class ShiftWidget(QWidget):
     def activate(self):
         """Called when this stage becomes active."""
         self._stop_playback()
+        self._stop_marking()
         self.combo_stack.blockSignals(True)
         self.combo_stack.clear()
         names = self.data_manager.get_stack_names()
@@ -260,6 +238,14 @@ class ShiftWidget(QWidget):
                 or not np.array_equal(self.shift_model.base_mask, self.data_manager.mask)):
             self.shift_model = ShiftModel(self.data_manager.mask, n_t)
             self._reset_heatmap()
+            # Underlying data changed — discard anchors and points layer
+            self._anchors.clear()
+            self._refresh_anchor_list()
+            try:
+                self.viewer_manager.viewer.layers.remove("_drift_anchors")
+            except Exception:
+                pass
+            self._points_layer = None
 
         # Re-hook label events in case the labels layer was recreated
         self._label_event_connected = False
@@ -312,58 +298,20 @@ class ShiftWidget(QWidget):
             self.time_slider.setValue(t)
 
     def _on_plane_changed(self, event=None):
-        """napari dims changed — update shift spinboxes for the new plane."""
-        self._update_shift_spinboxes()
+        """napari dims changed — update time marker and anchor list for the new plane."""
         self._update_time_marker()
+        self._refresh_anchor_list()
 
-    def _on_shift_changed(self):
-        """User changed dx or dy spinbox — store and redisplay."""
-        if self._updating_ui or self.shift_model is None:
-            return
-        t = self._current_time()
-        p = self._current_plane()
-        dx = self.dx_slider.value()
-        dy = self.dy_slider.value()
-        self.dx_label.setText(str(dx))
-        self.dy_label.setText(str(dy))
-        self.shift_model.set_shift(t, p, dx, dy)
-        self._display_mask()
-        self._update_heatmap()
-
-    def _on_copy_all_timepoints(self):
+    def _on_copy_plane_trace_to_all(self):
+        """Copy the current plane's full time-trace of shifts to every other plane."""
         if self.shift_model is None:
             return
         p = self._current_plane()
-        dx = self.dx_slider.value()
-        dy = self.dy_slider.value()
-        self.shift_model.set_shift_all_timepoints(p, dx, dy)
-        self.status_label.setText(
-            f"Copied shift ({dx}, {dy}) to all timepoints for plane {p}"
-        )
-        self._update_heatmap()
-
-    def _on_copy_all_planes(self):
-        if self.shift_model is None:
-            return
-        t = self._current_time()
-        dx = self.dx_slider.value()
-        dy = self.dy_slider.value()
-        self.shift_model.set_shift_all_planes(t, dx, dy)
+        trace = self.shift_model.shifts[:, p, :].copy()   # (n_timepoints, 2)
+        self.shift_model.shifts[:, :, :] = trace[:, np.newaxis, :]
         self._display_mask()
         self.status_label.setText(
-            f"Copied shift ({dx}, {dy}) to all planes for timepoint {t}"
-        )
-        self._update_heatmap()
-
-    def _on_copy_all_planes_timepoints(self):
-        if self.shift_model is None:
-            return
-        dx = self.dx_slider.value()
-        dy = self.dy_slider.value()
-        self.shift_model.shifts[:, :] = [dx, dy]
-        self._display_mask()
-        self.status_label.setText(
-            f"Copied shift ({dx}, {dy}) to all planes and timepoints"
+            f"Shift time trace from plane {p} copied to all planes"
         )
         self._update_heatmap()
 
@@ -432,71 +380,18 @@ class ShiftWidget(QWidget):
         if self.shift_model is None:
             return
         self.shift_model.reset_all()
-        self._update_shift_spinboxes()
+        self._anchors.clear()
+        self._refresh_anchor_list()
+        self.anchor_status.setText("")
+        self._stop_marking()
+        try:
+            self.viewer_manager.viewer.layers.remove("_drift_anchors")
+        except Exception:
+            pass
+        self._points_layer = None
         self._display_mask()
         self.status_label.setText("All shifts reset to (0, 0)")
         self._update_heatmap()
-
-    def _on_anchor(self):
-        """Record the current timepoint, plane, and shift as anchor."""
-        if self.shift_model is None:
-            return
-        self._anchor_t = self._current_time()
-        self._anchor_plane = self._current_plane()
-        self._anchor_dx = self.dx_slider.value()
-        self._anchor_dy = self.dy_slider.value()
-
-        self.btn_anchor.setEnabled(False)
-        self.btn_range_apply.setEnabled(True)
-        self.btn_range_cancel.setEnabled(True)
-        self.range_status.setText(
-            f"Anchored at t={self._anchor_t}, plane {self._anchor_plane}, "
-            f"shift ({self._anchor_dx}, {self._anchor_dy}).\n"
-            f"Scroll to target and click Apply."
-        )
-
-    def _on_range_apply(self):
-        """Apply the anchored shift to the range anchor_t..current_t."""
-        if self.shift_model is None or self._anchor_t is None:
-            return
-        t_now = self._current_time()
-        t_start = min(self._anchor_t, t_now)
-        t_end = max(self._anchor_t, t_now)
-        dx, dy = self._anchor_dx, self._anchor_dy
-
-        if self.chk_all_planes.isChecked():
-            for p in range(self.shift_model.n_planes):
-                self.shift_model.set_shift_range(t_start, t_end, p, dx, dy)
-            plane_msg = "all planes"
-        else:
-            self.shift_model.set_shift_range(
-                t_start, t_end, self._anchor_plane, dx, dy
-            )
-            plane_msg = f"plane {self._anchor_plane}"
-
-        self.status_label.setText(
-            f"Applied shift ({dx}, {dy}) to t={t_start}..{t_end} for {plane_msg}"
-        )
-        self._clear_anchor()
-        self._display_mask()
-        self._update_shift_spinboxes()
-        self._update_heatmap()
-
-    def _on_range_cancel(self):
-        """Cancel the anchored range apply."""
-        self._clear_anchor()
-        self.status_label.setText("Range apply cancelled")
-
-    def _clear_anchor(self):
-        """Reset anchor state and UI back to idle."""
-        self._anchor_t = None
-        self._anchor_dx = None
-        self._anchor_dy = None
-        self._anchor_plane = None
-        self.btn_anchor.setEnabled(True)
-        self.btn_range_apply.setEnabled(False)
-        self.btn_range_cancel.setEnabled(False)
-        self.range_status.setText("")
 
     # ---- Playback ----------------------------------------------------------
 
@@ -529,8 +424,224 @@ class ShiftWidget(QWidget):
         """Reflect current playing/paused state in button text."""
         playing = self._play_timer.isActive()
         m = self._play_multiplier
+        self.btn_play_10x.setText("⏸ 10×" if (playing and m == 10) else "▶ 10×")
         self.btn_play_20x.setText("⏸ 20×" if (playing and m == 20) else "▶ 20×")
         self.btn_play_40x.setText("⏸ 40×" if (playing and m == 40) else "▶ 40×")
+
+    # ---- Drift correction --------------------------------------------------
+
+    def _on_start_marking(self):
+        """Toggle drift-correction marking mode on/off."""
+        if self._marking_active:
+            self._stop_marking()
+            return
+        self._marking_active = True
+        self.btn_start_marking.setText("Stop marking")
+        self.anchor_status.setText(
+            "Select the Points layer, then click a landmark in the viewer. "
+            "First click per plane = reference (shift 0)."
+        )
+        # Create (or reuse) a Points layer for capturing positions
+        viewer = self.viewer_manager.viewer
+        try:
+            self._points_layer = viewer.layers["_drift_anchors"]
+        except KeyError:
+            self._points_layer = viewer.add_points(
+                name="_drift_anchors",
+                size=10,
+                face_color="yellow",
+                edge_color="white",
+                ndim=3,
+            )
+        self._prev_n_points = len(self._points_layer.data)
+        self._points_layer.mode = "add"
+        self._points_layer.events.data.connect(self._on_points_data_changed)
+        viewer.layers.selection.active = self._points_layer
+
+    def _stop_marking(self):
+        """Exit marking mode (keeps the Points layer visible for reference)."""
+        if not self._marking_active:
+            return
+        self._marking_active = False
+        self.btn_start_marking.setText("Start marking")
+        if self._points_layer is not None:
+            try:
+                self._points_layer.events.data.disconnect(self._on_points_data_changed)
+                self._points_layer.mode = "pan_zoom"
+            except Exception:
+                pass
+
+    def _on_points_data_changed(self, event=None):
+        """Called when a point is added to the drift anchors layer."""
+        layer = self._points_layer
+        if layer is None:
+            return
+        n = len(layer.data)
+        if n <= self._prev_n_points:
+            return   # deletion or no change — ignore
+        # A new point was added; use its (y, x) coordinates
+        new_pt = layer.data[-1]   # shape: (z, y, x) because ndim=3
+        x = float(new_pt[-1])
+        y = float(new_pt[-2])
+        p = self._current_plane()
+        t = self._current_time()
+        self._prev_n_points = n
+        self._add_anchor(p, t, x, y)
+
+    def _add_anchor(self, plane, t, x, y):
+        """Add (t, x, y) as an anchor for the given plane and recompute shifts."""
+        if plane not in self._anchors:
+            self._anchors[plane] = []
+        # Replace if same timepoint already exists for this plane
+        self._anchors[plane] = [a for a in self._anchors[plane] if a[0] != t]
+        self._anchors[plane].append((t, x, y))
+        self._anchors[plane].sort(key=lambda a: a[0])
+        self._refresh_anchor_list()
+        if self.shift_model is not None:
+            self._apply_anchor_interpolation(plane)
+
+    def _apply_anchor_interpolation(self, plane):
+        """Linearly interpolate shifts between anchors, then apply backwards
+        exponential smoothing, and write into the shifts array.
+
+        Backwards filtering (from t=T-1 to t=0) compensates for the user
+        clicking an anchor slightly *after* the actual drift has occurred:
+        the smoothed shift propagates the anchor's influence back in time
+        with a time constant τ set by the tau_spinbox.
+        """
+        from scipy.interpolate import interp1d
+
+        anchors = self._anchors.get(plane, [])
+        if not anchors:
+            return
+
+        ref_t, ref_x, ref_y = anchors[0]   # first entry is the reference
+
+        # Build control-point arrays.
+        # dx = anchor_x - ref_x: positive when the feature moved right → shift mask right.
+        ts  = np.array([a[0] for a in anchors], dtype=float)
+        dxs = np.array([a[1] - ref_x for a in anchors], dtype=float)
+        dys = np.array([a[2] - ref_y for a in anchors], dtype=float)
+
+        all_t = np.arange(self.shift_model.n_timepoints, dtype=float)
+        n = len(anchors)
+
+        if n == 1:
+            raw_dx = np.zeros(len(all_t))
+            raw_dy = np.zeros(len(all_t))
+        else:
+            fx = interp1d(ts, dxs, kind="linear", bounds_error=False,
+                          fill_value=(dxs[0], dxs[-1]))
+            fy = interp1d(ts, dys, kind="linear", bounds_error=False,
+                          fill_value=(dys[0], dys[-1]))
+            raw_dx = fx(all_t)
+            raw_dy = fy(all_t)
+
+        # Backwards exponential smoothing
+        tau_s  = self.tau_spinbox.value()
+        acq_hz = self.acq_rate_spinbox.value()
+        filt_dx = self._exp_backfilter(raw_dx, tau_s, acq_hz)
+        filt_dy = self._exp_backfilter(raw_dy, tau_s, acq_hz)
+
+        self.shift_model.shifts[:, plane, 0] = np.clip(
+            np.round(filt_dx).astype(int), -32768, 32767
+        )
+        self.shift_model.shifts[:, plane, 1] = np.clip(
+            np.round(filt_dy).astype(int), -32768, 32767
+        )
+
+        self._display_mask()
+        self._update_heatmap()
+        tau_msg = f", τ={tau_s:.2f} s" if tau_s > 0 else ""
+        self.anchor_status.setText(
+            f"plane {plane}: {n} anchor(s) — linear interp{tau_msg}"
+        )
+
+    @staticmethod
+    def _exp_backfilter(arr, tau_s, acq_hz):
+        """Backwards exponential smoothing with time constant *tau_s* seconds.
+
+        Processes the array from t = T-1 down to t = 0 using:
+            out[t] = α·x[t] + (1−α)·out[t+1],   α = 1 − exp(−dt/τ)
+
+        This means a step change at t_click decays smoothly back toward
+        earlier timepoints — compensating for the user clicking after the
+        drift was actually visible.  τ = 0 returns an unchanged copy.
+        """
+        if tau_s <= 0.0 or acq_hz <= 0.0:
+            return arr.copy()
+        alpha = 1.0 - np.exp(-1.0 / (tau_s * acq_hz))
+        out = arr.copy()
+        for t in range(len(out) - 2, -1, -1):
+            out[t] = alpha * arr[t] + (1.0 - alpha) * out[t + 1]
+        return out
+
+    def _refresh_anchor_list(self):
+        """Rebuild the anchor list widget for the current plane."""
+        self.anchor_list.clear()
+        p = self._current_plane()
+        anchors = self._anchors.get(p, [])
+        if not anchors:
+            return
+        ref_t, ref_x, ref_y = anchors[0]
+        for i, (t, x, y) in enumerate(anchors):
+            if i == 0:
+                label = f"t={t}  (reference)  x={x:.1f}  y={y:.1f}"
+            else:
+                dx = round(x - ref_x)
+                dy = round(y - ref_y)
+                label = f"t={t}  x={x:.1f}  y={y:.1f}  →  dx={dx}  dy={dy}"
+            self.anchor_list.addItem(label)
+
+    def _on_remove_anchor(self):
+        """Remove the selected anchor and recompute interpolation."""
+        p = self._current_plane()
+        row = self.anchor_list.currentRow()
+        if row < 0 or p not in self._anchors:
+            return
+        del self._anchors[p][row]
+        self._refresh_anchor_list()
+        if self.shift_model is not None:
+            if self._anchors.get(p):
+                self._apply_anchor_interpolation(p)
+            else:
+                # No anchors left — zero out this plane's shifts
+                self.shift_model.shifts[:, p] = 0
+                self._display_mask()
+                self._update_heatmap()
+
+    def _on_clear_plane_anchors(self):
+        """Clear all anchors for the current plane, remove their points from
+        the Points layer, and reset the plane's shifts to 0."""
+        p = self._current_plane()
+        self._anchors.pop(p, None)
+        self.anchor_status.setText("")
+        self._refresh_anchor_list()
+
+        # Remove points belonging to this plane from the napari Points layer.
+        # Points are (z, y, x) with ndim=3; z == current plane index.
+        if self._points_layer is not None:
+            try:
+                data = self._points_layer.data
+                if len(data) > 0:
+                    keep = np.round(data[:, 0]).astype(int) != p
+                    self._points_layer.data = data[keep]
+                    self._prev_n_points = len(self._points_layer.data)
+            except Exception:
+                pass
+
+        if self.shift_model is not None:
+            self.shift_model.shifts[:, p] = 0
+            self._display_mask()
+            self._update_heatmap()
+
+    def _on_tau_changed(self):
+        """Re-run interpolation + filtering for every plane that has anchors."""
+        if self.shift_model is None:
+            return
+        for plane, anchors in list(self._anchors.items()):
+            if anchors:
+                self._apply_anchor_interpolation(plane)
 
     def _display_current(self, auto_contrast=False):
         """Load and display the current timepoint's image and shifted mask."""
@@ -542,7 +653,6 @@ class ShiftWidget(QWidget):
         img = self.data_manager.get_timepoint(stack_name, t)
         self.viewer_manager.show_image(img, name="reference", auto_contrast=auto_contrast)
         self._display_mask()
-        self._update_shift_spinboxes()
         self._update_time_marker()
 
     # ---- Label-edit sync ------------------------------------------------
@@ -591,52 +701,26 @@ class ShiftWidget(QWidget):
         """Apply shifts and display the mask for the current timepoint.
 
         Syncs any user edits first so they are preserved before overwriting.
+        Skipped during playback: the sync reads the *previously displayed*
+        labels and un-shifts them by the *new* timepoint's shift, which
+        cancels the shift and makes the mask appear stuck at position 0.
         While an anchor is active, previews the anchored shift on the
         relevant plane(s) so the user can see where the mask will land.
         """
-        self._sync_user_edits()
+        if self._play_timer.isActive():
+            self._pending_label_sync = False   # discard stale sync from previous frame
+        else:
+            self._sync_user_edits()
 
         if self.shift_model is None:
             return
         t = self._current_time()
         shifted = self.shift_model.apply_shifts_for_timepoint(t)
 
-        # Preview anchored shift while in range-apply mode
-        if self._anchor_t is not None:
-            dx, dy = self._anchor_dx, self._anchor_dy
-            if self.chk_all_planes.isChecked():
-                for p in range(self.shift_model.n_planes):
-                    base_p = self.shift_model._plane_masks.get(
-                        (t, p), self.shift_model.base_mask[p]
-                    )
-                    shifted[p] = self.shift_model._shift_plane(base_p, dx, dy)
-            else:
-                p = self._anchor_plane
-                base_p = self.shift_model._plane_masks.get(
-                    (t, p), self.shift_model.base_mask[p]
-                )
-                shifted[p] = self.shift_model._shift_plane(base_p, dx, dy)
-
         self._our_update = True
         self.viewer_manager.show_labels(shifted, name="mask")
         self._our_update = False
         self._connect_label_events()
-
-    def _update_shift_spinboxes(self):
-        """Update spinbox values to reflect stored shifts for current (t, plane)."""
-        if self.shift_model is None:
-            return
-        t = self._current_time()
-        p = self._current_plane()
-        self.plane_label.setText(f"plane: {p}")
-
-        self._updating_ui = True
-        dx, dy = self.shift_model.get_shift(t, p)
-        self.dx_slider.setValue(dx)
-        self.dy_slider.setValue(dy)
-        self.dx_label.setText(str(dx))
-        self.dy_label.setText(str(dy))
-        self._updating_ui = False
 
     # ---- Heatmap helpers ------------------------------------------------
 
