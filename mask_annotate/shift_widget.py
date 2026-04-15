@@ -1,9 +1,9 @@
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QComboBox, QSpinBox, QSlider, QFileDialog, QGroupBox,
+    QComboBox, QSpinBox, QDoubleSpinBox, QSlider, QFileDialog, QGroupBox,
     QProgressBar, QApplication, QCheckBox,
 )
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -22,6 +22,11 @@ class ShiftWidget(QWidget):
 
         self._updating_ui = False  # guard against feedback loops
         self._dims_connected = False
+
+        # Playback
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._step_forward)
+        self._play_multiplier = 20
 
         self._our_update = False          # True while we write to the labels layer
         self._pending_label_sync = False  # True when user has edited labels
@@ -64,6 +69,26 @@ class ShiftWidget(QWidget):
 
         self.time_label = QLabel("timepoint = 0")
         time_layout.addWidget(self.time_label)
+
+        # Volume rate + play buttons
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(QLabel("volume rate (Hz):"))
+        self.acq_rate_spinbox = QDoubleSpinBox()
+        self.acq_rate_spinbox.setRange(0.1, 1000.0)
+        self.acq_rate_spinbox.setDecimals(1)
+        self.acq_rate_spinbox.setValue(8.0)
+        rate_row.addWidget(self.acq_rate_spinbox)
+        time_layout.addLayout(rate_row)
+
+        play_row = QHBoxLayout()
+        self.btn_play_20x = QPushButton("▶ 20×")
+        self.btn_play_40x = QPushButton("▶ 40×")
+        self.btn_play_20x.clicked.connect(lambda: self._on_play(20))
+        self.btn_play_40x.clicked.connect(lambda: self._on_play(40))
+        play_row.addWidget(self.btn_play_20x)
+        play_row.addWidget(self.btn_play_40x)
+        time_layout.addLayout(play_row)
+
         layout.addWidget(time_group)
 
         # --- Plane & shift controls ---
@@ -213,6 +238,7 @@ class ShiftWidget(QWidget):
 
     def activate(self):
         """Called when this stage becomes active."""
+        self._stop_playback()
         self.combo_stack.blockSignals(True)
         self.combo_stack.clear()
         names = self.data_manager.get_stack_names()
@@ -471,6 +497,40 @@ class ShiftWidget(QWidget):
         self.btn_range_apply.setEnabled(False)
         self.btn_range_cancel.setEnabled(False)
         self.range_status.setText("")
+
+    # ---- Playback ----------------------------------------------------------
+
+    def _on_play(self, multiplier):
+        """Start playback at the given speed multiplier, switch speed, or pause."""
+        acq_hz = self.acq_rate_spinbox.value()
+        interval_ms = max(1, round(1000 / (multiplier * acq_hz)))
+        if self._play_timer.isActive() and self._play_multiplier == multiplier:
+            self._stop_playback()
+        else:
+            self._play_multiplier = multiplier
+            self._play_timer.setInterval(interval_ms)
+            self._play_timer.start()
+            self._update_play_buttons()
+
+    def _step_forward(self):
+        """Advance one timepoint; stop automatically at the end."""
+        t = self._current_time()
+        if t >= self.time_slider.maximum():
+            self._stop_playback()
+            return
+        self.time_slider.setValue(t + 1)
+
+    def _stop_playback(self):
+        """Stop playback and reset button labels."""
+        self._play_timer.stop()
+        self._update_play_buttons()
+
+    def _update_play_buttons(self):
+        """Reflect current playing/paused state in button text."""
+        playing = self._play_timer.isActive()
+        m = self._play_multiplier
+        self.btn_play_20x.setText("⏸ 20×" if (playing and m == 20) else "▶ 20×")
+        self.btn_play_40x.setText("⏸ 40×" if (playing and m == 40) else "▶ 40×")
 
     def _display_current(self, auto_contrast=False):
         """Load and display the current timepoint's image and shifted mask."""
