@@ -25,8 +25,9 @@ class ShiftWidget(QWidget):
 
         # Playback
         self._play_timer = QTimer(self)
-        self._play_timer.timeout.connect(self._step_forward)
+        self._play_timer.timeout.connect(self._step_playback)
         self._play_multiplier = 20
+        self._play_direction = 1   # +1 = forward, -1 = rewind
 
         self._our_update = False          # True while we write to the labels layer
         self._pending_label_sync = False  # True when user has edited labels
@@ -84,13 +85,25 @@ class ShiftWidget(QWidget):
         self.btn_play_10x = QPushButton("▶ 10×")
         self.btn_play_20x = QPushButton("▶ 20×")
         self.btn_play_40x = QPushButton("▶ 40×")
-        self.btn_play_10x.clicked.connect(lambda: self._on_play(10))
-        self.btn_play_20x.clicked.connect(lambda: self._on_play(20))
-        self.btn_play_40x.clicked.connect(lambda: self._on_play(40))
+        self.btn_play_10x.clicked.connect(lambda: self._on_play(10, 1))
+        self.btn_play_20x.clicked.connect(lambda: self._on_play(20, 1))
+        self.btn_play_40x.clicked.connect(lambda: self._on_play(40, 1))
         play_row.addWidget(self.btn_play_10x)
         play_row.addWidget(self.btn_play_20x)
         play_row.addWidget(self.btn_play_40x)
         time_layout.addLayout(play_row)
+
+        rewind_row = QHBoxLayout()
+        self.btn_rewind_10x = QPushButton("◀ 10×")
+        self.btn_rewind_20x = QPushButton("◀ 20×")
+        self.btn_rewind_40x = QPushButton("◀ 40×")
+        self.btn_rewind_10x.clicked.connect(lambda: self._on_play(10, -1))
+        self.btn_rewind_20x.clicked.connect(lambda: self._on_play(20, -1))
+        self.btn_rewind_40x.clicked.connect(lambda: self._on_play(40, -1))
+        rewind_row.addWidget(self.btn_rewind_10x)
+        rewind_row.addWidget(self.btn_rewind_20x)
+        rewind_row.addWidget(self.btn_rewind_40x)
+        time_layout.addLayout(rewind_row)
 
         layout.addWidget(time_group)
 
@@ -395,25 +408,38 @@ class ShiftWidget(QWidget):
 
     # ---- Playback ----------------------------------------------------------
 
-    def _on_play(self, multiplier):
-        """Start playback at the given speed multiplier, switch speed, or pause."""
+    def _on_play(self, multiplier, direction):
+        """Start/switch/pause playback.
+
+        direction: +1 = forward, -1 = rewind.
+        Clicking the active button (same multiplier + direction) pauses.
+        """
         acq_hz = self.acq_rate_spinbox.value()
         interval_ms = max(1, round(1000 / (multiplier * acq_hz)))
-        if self._play_timer.isActive() and self._play_multiplier == multiplier:
+        if (self._play_timer.isActive()
+                and self._play_multiplier == multiplier
+                and self._play_direction == direction):
             self._stop_playback()
         else:
             self._play_multiplier = multiplier
+            self._play_direction = direction
             self._play_timer.setInterval(interval_ms)
             self._play_timer.start()
             self._update_play_buttons()
 
-    def _step_forward(self):
-        """Advance one timepoint; stop automatically at the end."""
+    def _step_playback(self):
+        """Advance or rewind one timepoint; stop automatically at the boundary."""
         t = self._current_time()
-        if t >= self.time_slider.maximum():
-            self._stop_playback()
-            return
-        self.time_slider.setValue(t + 1)
+        if self._play_direction > 0:
+            if t >= self.time_slider.maximum():
+                self._stop_playback()
+                return
+            self.time_slider.setValue(t + 1)
+        else:
+            if t <= 0:
+                self._stop_playback()
+                return
+            self.time_slider.setValue(t - 1)
 
     def _stop_playback(self):
         """Stop playback and reset button labels."""
@@ -422,11 +448,15 @@ class ShiftWidget(QWidget):
 
     def _update_play_buttons(self):
         """Reflect current playing/paused state in button text."""
-        playing = self._play_timer.isActive()
+        active = self._play_timer.isActive()
         m = self._play_multiplier
-        self.btn_play_10x.setText("⏸ 10×" if (playing and m == 10) else "▶ 10×")
-        self.btn_play_20x.setText("⏸ 20×" if (playing and m == 20) else "▶ 20×")
-        self.btn_play_40x.setText("⏸ 40×" if (playing and m == 40) else "▶ 40×")
+        d = self._play_direction
+        self.btn_play_10x.setText("⏸ 10×" if (active and m == 10 and d == 1)  else "▶ 10×")
+        self.btn_play_20x.setText("⏸ 20×" if (active and m == 20 and d == 1)  else "▶ 20×")
+        self.btn_play_40x.setText("⏸ 40×" if (active and m == 40 and d == 1)  else "▶ 40×")
+        self.btn_rewind_10x.setText("⏸ 10×" if (active and m == 10 and d == -1) else "◀ 10×")
+        self.btn_rewind_20x.setText("⏸ 20×" if (active and m == 20 and d == -1) else "◀ 20×")
+        self.btn_rewind_40x.setText("⏸ 40×" if (active and m == 40 and d == -1) else "◀ 40×")
 
     # ---- Drift correction --------------------------------------------------
 
@@ -446,13 +476,22 @@ class ShiftWidget(QWidget):
         try:
             self._points_layer = viewer.layers["_drift_anchors"]
         except KeyError:
-            self._points_layer = viewer.add_points(
-                name="_drift_anchors",
-                size=10,
-                face_color="yellow",
-                edge_color="white",
-                ndim=3,
-            )
+            # Match the points layer dimensionality to the viewer so napari
+            # never has to insert NaN for missing dimensions (avoids the
+            # "invalid value encountered in cast" warning on Windows/ANGLE).
+            n_dims = viewer.dims.ndim
+            empty = np.empty((0, n_dims), dtype=float)
+            # border_color replaced edge_color in napari 0.4.19
+            _pts_kwargs = dict(name="_drift_anchors", size=10,
+                               face_color="yellow")
+            try:
+                self._points_layer = viewer.add_points(
+                    empty, border_color="white", **_pts_kwargs
+                )
+            except TypeError:
+                self._points_layer = viewer.add_points(
+                    empty, edge_color="white", **_pts_kwargs
+                )
         self._prev_n_points = len(self._points_layer.data)
         self._points_layer.mode = "add"
         self._points_layer.events.data.connect(self._on_points_data_changed)
