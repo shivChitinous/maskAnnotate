@@ -480,10 +480,15 @@ class ShiftWidget(QWidget):
             # so napari never has to insert NaN for missing dimensions.
             n_dims = viewer.dims.ndim
             empty = np.empty((0, n_dims), dtype=float)
-            self._points_layer = viewer.add_points(
-                empty, name="_drift_anchors", size=10,
-                face_color="yellow", border_color="white",
-            )
+            _pts_kwargs = dict(name="_drift_anchors", size=10, face_color="yellow")
+            try:
+                self._points_layer = viewer.add_points(
+                    empty, border_color="white", **_pts_kwargs
+                )
+            except TypeError:
+                self._points_layer = viewer.add_points(
+                    empty, edge_color="white", **_pts_kwargs
+                )
         self._prev_n_points = len(self._points_layer.data)
         self._points_layer.mode = "add"
         viewer.layers.selection.active = self._points_layer
