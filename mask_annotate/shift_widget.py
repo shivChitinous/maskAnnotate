@@ -143,9 +143,13 @@ class ShiftWidget(QWidget):
         other_act_group = QGroupBox("Other Actions")
         other_act_layout = QVBoxLayout(other_act_group)
 
-        self.btn_push_to_base = QPushButton("Push to base mask")
+        self.btn_push_to_base = QPushButton("Push to base mask (all planes)")
         self.btn_push_to_base.clicked.connect(self._on_push_to_base)
         other_act_layout.addWidget(self.btn_push_to_base)
+
+        self.btn_push_plane_to_base = QPushButton("Push to base mask (this plane)")
+        self.btn_push_plane_to_base.clicked.connect(self._on_push_plane_to_base)
+        other_act_layout.addWidget(self.btn_push_plane_to_base)
 
         layout.addWidget(other_act_group)
 
@@ -359,11 +363,7 @@ class ShiftWidget(QWidget):
         )
 
     def _on_push_to_base(self):
-        """Write all edited planes at this timepoint into base_mask.
-
-        Each plane's override (or base_mask fallback) becomes the new base,
-        affecting all timepoints that have no individual (t, p) override.
-        """
+        """Write all edited planes at this timepoint into base_mask."""
         if self.shift_model is None:
             return
         self._pending_label_sync = True
@@ -377,6 +377,23 @@ class ShiftWidget(QWidget):
         self.data_manager.mask[:] = self.shift_model.base_mask
         self.status_label.setText(
             f"all planes at timepoint {t} pushed to base mask"
+        )
+
+    def _on_push_plane_to_base(self):
+        """Write only the current plane's edit at this timepoint into base_mask."""
+        if self.shift_model is None:
+            return
+        self._pending_label_sync = True
+        self._sync_user_edits()
+        t = self._current_time()
+        p = self._current_plane()
+        src = self.shift_model._plane_masks.get(
+            (t, p), self.shift_model.base_mask[p]
+        )
+        self.shift_model.base_mask[p] = src.copy()
+        self.data_manager.mask[p] = self.shift_model.base_mask[p]
+        self.status_label.setText(
+            f"plane {p} at timepoint {t} pushed to base mask"
         )
 
     def _on_reset_to_base(self):
