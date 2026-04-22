@@ -476,26 +476,18 @@ class ShiftWidget(QWidget):
         try:
             self._points_layer = viewer.layers["_drift_anchors"]
         except KeyError:
-            # Match the points layer dimensionality to the viewer so napari
-            # never has to insert NaN for missing dimensions (avoids the
-            # "invalid value encountered in cast" warning on Windows/ANGLE).
+            # Use an explicit empty array shaped to the viewer's dimensionality
+            # so napari never has to insert NaN for missing dimensions.
             n_dims = viewer.dims.ndim
             empty = np.empty((0, n_dims), dtype=float)
-            # border_color replaced edge_color in napari 0.4.19
-            _pts_kwargs = dict(name="_drift_anchors", size=10,
-                               face_color="yellow")
-            try:
-                self._points_layer = viewer.add_points(
-                    empty, border_color="white", **_pts_kwargs
-                )
-            except TypeError:
-                self._points_layer = viewer.add_points(
-                    empty, edge_color="white", **_pts_kwargs
-                )
+            self._points_layer = viewer.add_points(
+                empty, name="_drift_anchors", size=10,
+                face_color="yellow", border_color="white",
+            )
         self._prev_n_points = len(self._points_layer.data)
         self._points_layer.mode = "add"
-        self._points_layer.events.data.connect(self._on_points_data_changed)
         viewer.layers.selection.active = self._points_layer
+        self._points_layer.events.data.connect(self._on_points_data_changed)
 
     def _stop_marking(self):
         """Exit marking mode (keeps the Points layer visible for reference)."""
