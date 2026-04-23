@@ -38,6 +38,7 @@ class ShiftWidget(QWidget):
         self._marking_active = False
         self._points_layer = None
         self._prev_n_points = 0
+        self._ignore_data_event = False  # True while we programmatically set layer data
 
         self._build_ui()
 
@@ -114,6 +115,18 @@ class ShiftWidget(QWidget):
         self.btn_copy_plane_trace = QPushButton("Copy time trace to all planes")
         self.btn_copy_plane_trace.clicked.connect(self._on_copy_plane_trace_to_all)
         shift_act_layout.addWidget(self.btn_copy_plane_trace)
+
+        self.btn_apply_shift_this_plane = QPushButton(
+            "Apply current shift to all timepoints (this plane)"
+        )
+        self.btn_apply_shift_this_plane.clicked.connect(self._on_apply_shift_all_timepoints)
+        shift_act_layout.addWidget(self.btn_apply_shift_this_plane)
+
+        self.btn_apply_shift_all = QPushButton(
+            "Apply current shift to all planes and timepoints"
+        )
+        self.btn_apply_shift_all.clicked.connect(self._on_apply_shift_all_planes_timepoints)
+        shift_act_layout.addWidget(self.btn_apply_shift_all)
 
         self.btn_reset = QPushButton("Reset all shifts")
         self.btn_reset.clicked.connect(self._on_reset)
@@ -318,6 +331,7 @@ class ShiftWidget(QWidget):
         """napari dims changed — update time marker and anchor list for the new plane."""
         self._update_time_marker()
         self._refresh_anchor_list()
+        self._rebuild_points_layer_from_anchors()
 
     def _on_copy_plane_trace_to_all(self):
         """Copy the current plane's full time-trace of shifts to every other plane."""
@@ -331,6 +345,93 @@ class ShiftWidget(QWidget):
             f"Shift time trace from plane {p} copied to all planes"
         )
         self._update_heatmap()
+
+    def _on_apply_shift_all_timepoints(self):
+        """Apply the current plane's shift at the current timepoint to every timepoint."""
+        if self.shift_model is None:
+            return
+        t = self._current_time()
+        p = self._current_plane()
+        dx, dy = self.shift_model.get_shift(t, p)
+        self.shift_model.shifts[:, p, 0] = dx
+        self.shift_model.shifts[:, p, 1] = dy
+        # Keep only the reference anchor for this plane
+        self._keep_reference_anchor_only(p)
+        self._stop_marking()
+        self._rebuild_points_layer_from_anchors()
+        self._refresh_anchor_list()
+        self._display_mask()
+        self._update_heatmap()
+        self.status_label.setText(
+            f"Shift (dx={dx}, dy={dy}) applied to all timepoints for plane {p}"
+        )
+
+    def _on_apply_shift_all_planes_timepoints(self):
+        """Apply the current plane's shift at the current timepoint everywhere."""
+        if self.shift_model is None:
+            return
+        t = self._current_time()
+        p = self._current_plane()
+        dx, dy = self.shift_model.get_shift(t, p)
+        self.shift_model.shifts[:, :, 0] = dx
+        self.shift_model.shifts[:, :, 1] = dy
+        # Copy the current plane's reference anchor to every plane so that
+        # every plane starts from the same landmark position.
+        src_anchors = self._anchors.get(p, [])
+        if src_anchors:
+            ref_entry = src_anchors[0]   # (t_ref, x_ref, y_ref)
+            for plane in range(self.shift_model.n_planes):
+                self._anchors[plane] = [ref_entry]
+        else:
+            # No reference on this plane — clear everything
+            self._anchors.clear()
+        self._stop_marking()
+        self._rebuild_points_layer_from_anchors()
+        self._refresh_anchor_list()
+        self._display_mask()
+        self._update_heatmap()
+        self.status_label.setText(
+            f"Shift (dx={dx}, dy={dy}) applied to all planes and all timepoints"
+        )
+
+    def _keep_reference_anchor_only(self, plane):
+        """Reduce *plane*'s anchor list to just the reference (first) entry in-place.
+
+        Does NOT touch the Points layer — call _rebuild_points_layer_from_anchors
+        afterwards to sync the visual representation.
+        """
+        anchors = self._anchors.get(plane, [])
+        if anchors:
+            self._anchors[plane] = [anchors[0]]
+
+    def _rebuild_points_layer_from_anchors(self):
+        """Rebuild the _drift_anchors Points layer for the current plane only.
+
+        Anchors from other planes are not written — switching planes calls this
+        again and swaps in the new plane's dots.  Uses _ignore_data_event to
+        suppress our own data-change callback while writing, so the callback
+        stays permanently connected during marking and is never accidentally
+        left disconnected by a silently-caught exception.
+        """
+        if self._points_layer is None:
+            return
+        # Use the layer's own ndim — that is the ground truth for what shape
+        # data it accepts, and avoids any mismatch with viewer.dims.ndim.
+        ndim = self._points_layer.ndim
+        p = self._current_plane()
+        pts = []
+        for (at, ax, ay) in self._anchors.get(p, []):
+            if ndim >= 4:
+                pts.append([at, p, ay, ax])
+            else:
+                pts.append([p, ay, ax])
+        new_data = np.array(pts, dtype=float) if pts else np.empty((0, ndim), dtype=float)
+        self._ignore_data_event = True
+        try:
+            self._points_layer.data = new_data
+        finally:
+            self._ignore_data_event = False
+        self._prev_n_points = len(new_data)
 
     def _on_adopt_edit(self):
         """Sync current napari edits into the per-timepoint mask store."""
@@ -488,16 +589,28 @@ class ShiftWidget(QWidget):
             "Select the Points layer, then click a landmark in the viewer. "
             "First click per plane = reference (shift 0)."
         )
-        # Create (or reuse) a Points layer for capturing positions
+        # Create (or reuse) a Points layer for capturing positions.
+        # n_dims must be known before the try/except so we can validate a
+        # reused layer's ndim.
         viewer = self.viewer_manager.viewer
+        n_dims = viewer.dims.ndim
         try:
-            self._points_layer = viewer.layers["_drift_anchors"]
+            existing = viewer.layers["_drift_anchors"]
+            if existing.ndim == n_dims:
+                self._points_layer = existing
+            else:
+                # Stale layer from a different viewer dimensionality — remove
+                # it and fall through to create a fresh one.
+                viewer.layers.remove("_drift_anchors")
+                raise KeyError
         except KeyError:
-            # Use an explicit empty array shaped to the viewer's dimensionality
-            # so napari never has to insert NaN for missing dimensions.
-            n_dims = viewer.dims.ndim
             empty = np.empty((0, n_dims), dtype=float)
-            _pts_kwargs = dict(name="_drift_anchors", size=10, face_color="yellow")
+            # Pass ndim explicitly: older napari infers ndim=2 for empty arrays
+            # regardless of the array shape, so we must tell it the right value.
+            # Keep out_of_slice_display OUT of _pts_kwargs so a TypeError from
+            # an unsupported border_color kwarg doesn't also break that flag.
+            _pts_kwargs = dict(name="_drift_anchors", size=10, face_color="yellow",
+                               ndim=n_dims)
             try:
                 self._points_layer = viewer.add_points(
                     empty, border_color="white", **_pts_kwargs
@@ -506,10 +619,25 @@ class ShiftWidget(QWidget):
                 self._points_layer = viewer.add_points(
                     empty, edge_color="white", **_pts_kwargs
                 )
-        self._prev_n_points = len(self._points_layer.data)
+        # Enable out-of-slice display so anchors remain visible at all
+        # timepoints (not just the one where they were placed).  Wrapped in
+        # try/except so older napari versions that lack this attribute don't
+        # crash — anchors will simply only be visible at their exact timepoint.
+        try:
+            self._points_layer.out_of_slice_display = True
+        except Exception:
+            pass
         self._points_layer.mode = "add"
         viewer.layers.selection.active = self._points_layer
+        # Disconnect first to guard against a stale connection left by a
+        # failed _stop_marking (e.g. exception in disconnect), then reconnect
+        # exactly once.  _rebuild_points_layer_from_anchors sets _prev_n_points.
+        try:
+            self._points_layer.events.data.disconnect(self._on_points_data_changed)
+        except Exception:
+            pass
         self._points_layer.events.data.connect(self._on_points_data_changed)
+        self._rebuild_points_layer_from_anchors()
 
     def _stop_marking(self):
         """Exit marking mode (keeps the Points layer visible for reference)."""
@@ -526,6 +654,8 @@ class ShiftWidget(QWidget):
 
     def _on_points_data_changed(self, event=None):
         """Called when a point is added to the drift anchors layer."""
+        if self._ignore_data_event:
+            return   # programmatic update — not a user click
         layer = self._points_layer
         if layer is None:
             return
@@ -542,7 +672,14 @@ class ShiftWidget(QWidget):
         self._add_anchor(p, t, x, y)
 
     def _add_anchor(self, plane, t, x, y):
-        """Add (t, x, y) as an anchor for the given plane and recompute shifts."""
+        """Add (t, x, y) as an anchor for the given plane and recompute shifts.
+
+        We do NOT rebuild the Points layer here: napari's "add" mode already
+        placed the point in the layer when the user clicked, and rebuilding
+        would interfere with the _prev_n_points guard and napari's add-mode
+        state.  The layer is rebuilt only on plane changes (to swap which
+        plane's dots are shown) and on explicit bulk operations.
+        """
         if plane not in self._anchors:
             self._anchors[plane] = []
         # Replace if same timepoint already exists for this plane
@@ -654,6 +791,7 @@ class ShiftWidget(QWidget):
             return
         del self._anchors[p][row]
         self._refresh_anchor_list()
+        self._rebuild_points_layer_from_anchors()
         if self.shift_model is not None:
             if self._anchors.get(p):
                 self._apply_anchor_interpolation(p)
@@ -664,25 +802,12 @@ class ShiftWidget(QWidget):
                 self._update_heatmap()
 
     def _on_clear_plane_anchors(self):
-        """Clear all anchors for the current plane, remove their points from
-        the Points layer, and reset the plane's shifts to 0."""
+        """Clear all anchors for the current plane and reset its shifts to 0."""
         p = self._current_plane()
         self._anchors.pop(p, None)
         self.anchor_status.setText("")
         self._refresh_anchor_list()
-
-        # Remove points belonging to this plane from the napari Points layer.
-        # Points are (z, y, x) with ndim=3; z == current plane index.
-        if self._points_layer is not None:
-            try:
-                data = self._points_layer.data
-                if len(data) > 0:
-                    keep = np.round(data[:, 0]).astype(int) != p
-                    self._points_layer.data = data[keep]
-                    self._prev_n_points = len(self._points_layer.data)
-            except Exception:
-                pass
-
+        self._rebuild_points_layer_from_anchors()   # layer now shows empty for this plane
         if self.shift_model is not None:
             self.shift_model.shifts[:, p] = 0
             self._display_mask()
